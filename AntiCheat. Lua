@@ -1,0 +1,315 @@
+-- ServerScriptService/AntiCheat.lua
+-- Античит для гонок v3.5 (Final Stable)
+-- Защита от спама ремоутов, полёта, флайкаров, бесконечных прыжков, speed hack
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- =================== НАСТРОЙКИ ===================
+local CONFIG = {
+    -- Спам ремоутов
+    RemoteCooldown = 0.4,              -- секунд между вызовами одного ремоута
+    MaxRemoteCallsPerSecond = 25,      -- общий лимит вызовов в секунду
+    WhitelistedRemotes = {},           -- точные имена ремоутов которые не проверяются
+
+    -- Полёт пешехода
+    MaxAirTime = 8.0,                  -- макс. секунд в воздухе
+    TeleportAfterConsecutiveChecks = 2,-- сколько проверок подряд перед телепортом
+
+    -- Прыжки
+    JumpCooldown = 0.6,                -- секунд между прыжками
+    MaxConsecutiveJumps = 5,           -- макс. прыжков подряд
+
+    -- Машины
+    MaxVehicleHeight = 100,            -- макс. высота машины
+    MaxFallSpeed = -80,                -- скорость падения (speed hack)
+
+    -- Интервалы проверок
+    VehicleCheckInterval = 0.5,
+    PlayerCheckInterval = 0.3,
+    RampCheckInterval = 1.0,
+}
+
+local RAMP_TAG = "RampZone"
+
+-- =================== ДАННЫЕ ИГРОКОВ ===================
+local playerData = {}
+
+local function resetPlayerData(player)
+    playerData[player] = {
+        remoteCallTimes = {},
+        lastRemoteCall = 0,
+        remoteCallCount = 0,
+        lastJumpTime = 0,
+        jumpCount = 0,
+        airTime = 0,
+        flightDetectedCount = 0,
+        lastVehicleHeight = nil,
+        vehicleVerticalSpeed = 0,
+        nextRampCheck = 0,
+        lastRampResult = false,
+    }
+end
+
+local function getData(player)
+    if not playerData[player] then
+        resetPlayerData(player)
+    end
+    return playerData[player]
+end
+
+Players.PlayerAdded:Connect(function(player)
+    player.CharacterAdded:Connect(function()
+        local data = playerData[player]
+        if data then
+            data.jumpCount = 0
+            data.airTime = 0
+            data.flightDetectedCount = 0
+            data.lastVehicleHeight = nil
+            data.vehicleVerticalSpeed = 0
+        end
+    end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    playerData[player] = nil
+end)
+
+-- =================== УТИЛИТЫ ===================
+local function isOnRamp(position, data)
+    local now = tick()
+    if data and now < data.nextRampCheck then
+        return data.lastRampResult
+    end
+    local boxCF = CFrame.new(position)
+    local boxSize = Vector3.new(20, 20, 20)
+    local parts = Workspace:GetPartBoundsInBox(boxCF, boxSize, nil)
+    local result = false
+    for _, part in ipairs(parts) do
+        if CollectionService:HasTag(part, RAMP_TAG) then
+            result = true
+            break
+        end
+        if part.Parent and CollectionService:HasTag(part.Parent, RAMP_TAG) then
+            result = true
+            break
+        end
+    end
+    if data then
+        data.lastRampResult = result
+        data.nextRampCheck = now + CONFIG.RampCheckInterval
+    end
+    return result
+end
+
+local function isWhitelisted(remoteName)
+    for _, name in ipairs(CONFIG.WhitelistedRemotes) do
+        if remoteName == name then
+            return true
+        end
+    end
+    return false
+end
+
+local function checkRemoteSpam(player, remote)
+    local remoteName = remote:GetFullName()
+    if isWhitelisted(remoteName) then
+        return false
+    end
+
+    local data = getData(player)
+    local now = tick()
+
+    if data.remoteCallTimes[remoteName] and (now - data.remoteCallTimes[remoteName] < CONFIG.RemoteCooldown) then
+        warn("[AntiCheat] Спам от " .. player.Name .. ": " .. remoteName)
+        return true
+    end
+    data.remoteCallTimes[remoteName] = now
+
+    if now - data.lastRemoteCall > 1 then
+        data.remoteCallCount = 0
+        data.lastRemoteCall = now
+    else
+        data.remoteCallCount = data.remoteCallCount + 1
+        if data.remoteCallCount > CONFIG.MaxRemoteCallsPerSecond then
+            warn("[AntiCheat] Лимит вызовов: " .. player.Name)
+            return true
+        end
+    end
+    return false
+end
+
+-- =================== 1. ЗАЩИТА РЕМОУТОВ ===================
+local function setupRemoteProtection()
+    local function hookRemote(obj)
+        if not obj:IsA("RemoteEvent") then return end
+        if obj:GetAttribute("AntiCheatHooked") then return end
+        obj:SetAttribute("AntiCheatHooked", true)
+
+        local oldConnections = {}
+        local success, connections = pcall(getconnections, obj.OnServerEvent)
+        if success then
+            for _, conn in ipairs(connections) do
+                table.insert(oldConnections, conn)
+                pcall(function() conn:Disable() end)
+            end
+        else
+            warn("[AntiCheat] Не удалось отключить старые обработчики для " .. obj:GetFullName())
+        end
+
+        obj.OnServerEvent:Connect(function(player, ...)
+            if not player:IsA("Player") then return end
+            if checkRemoteSpam(player, obj) then return end
+
+            for _, conn in ipairs(oldConnections) do
+                task.spawn(function()
+                    conn.Function(player, ...)
+                end)
+            end
+        end)
+    end
+
+    for _, container in ipairs({ReplicatedStorage, Workspace}) do
+        for _, obj in ipairs(container:GetDescendants()) do
+            hookRemote(obj)
+        end
+    end
+    game.DescendantAdded:Connect(function(obj)
+        if obj:IsA("RemoteEvent") then
+            hookRemote(obj)
+        end
+    end)
+    print("[AntiCheat] Защита RemoteEvent активирована")
+end
+
+-- =================== 2. ЗАЩИТА ПЕШЕХОДА ===================
+local function setupMovementProtection()
+    task.spawn(function()
+        while true do
+            task.wait(CONFIG.PlayerCheckInterval)
+            for _, player in ipairs(Players:GetPlayers()) do
+                local character = player.Character
+                if not character then continue end
+                local humanoid = character:FindFirstChild("Humanoid")
+                local rootPart = character:FindFirstChild("HumanoidRootPart")
+                if not humanoid or not rootPart then continue end
+                local data = getData(player)
+                local state = humanoid:GetState()
+
+                if humanoid.SeatPart then
+                    data.airTime = 0
+                    data.jumpCount = 0
+                    data.flightDetectedCount = 0
+                    continue
+                end
+                if isOnRamp(rootPart.Position, data) then
+                    data.airTime = 0
+                    data.flightDetectedCount = 0
+                    continue
+                end
+
+                -- Полёт
+                if state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.Jumping then
+                    data.airTime = data.airTime + CONFIG.PlayerCheckInterval
+                    if data.airTime > CONFIG.MaxAirTime then
+                        data.flightDetectedCount = data.flightDetectedCount + 1
+                        if data.flightDetectedCount >= CONFIG.TeleportAfterConsecutiveChecks then
+                            warn("[AntiCheat] Полёт: " .. player.Name)
+                            local rayResult = Workspace:Raycast(rootPart.Position, Vector3.new(0, -200, 0))
+                            if rayResult then
+                                rootPart.CFrame = CFrame.new(rayResult.Position + Vector3.new(0, 3, 0))
+                            end
+                            data.airTime = 0
+                            data.flightDetectedCount = 0
+                        end
+                    end
+                else
+                    data.airTime = 0
+                    data.flightDetectedCount = 0
+                end
+
+                -- Прыжки
+                if state == Enum.HumanoidStateType.Jumping then
+                    local now = tick()
+                    if now - data.lastJumpTime < CONFIG.JumpCooldown then
+                        warn("[AntiCheat] Частые прыжки: " .. player.Name)
+                        humanoid.Jump = false
+                    else
+                        data.jumpCount = data.jumpCount + 1
+                        if data.jumpCount > CONFIG.MaxConsecutiveJumps then
+                            warn("[AntiCheat] Много прыжков: " .. player.Name)
+                            humanoid.Jump = false
+                        end
+                        data.lastJumpTime = now
+                    end
+                else
+                    data.jumpCount = 0
+                end
+            end
+        end
+    end)
+end
+
+-- =================== 3. ЗАЩИТА МАШИН ===================
+local function setupVehicleProtection()
+    local warnedMissingPrimaryPart = {}
+    task.spawn(function()
+        while true do
+            task.wait(CONFIG.VehicleCheckInterval)
+            for _, player in ipairs(Players:GetPlayers()) do
+                local character = player.Character
+                if not character then continue end
+                local humanoid = character:FindFirstChild("Humanoid")
+                if not humanoid or not humanoid.SeatPart then continue end
+                local seat = humanoid.SeatPart
+                local vehicle = seat.Parent
+                if not vehicle or not vehicle:IsA("Model") then continue end
+                local primaryPart = vehicle.PrimaryPart
+                if not primaryPart then
+                    primaryPart = vehicle:FindFirstChild("Base") 
+                        or vehicle:FindFirstChild("Chassis") 
+                        or vehicle:FindFirstChild("Engine")
+                        or vehicle:FindFirstChild("Body")
+                end
+                if not primaryPart then
+                    if not warnedMissingPrimaryPart[vehicle] then
+                        warn("[AntiCheat] У машины " .. vehicle.Name .. " нет PrimaryPart")
+                        warnedMissingPrimaryPart[vehicle] = true
+                    end
+                    continue
+                end
+                local data = getData(player)
+                local height = primaryPart.Position.Y
+                if data.lastVehicleHeight then
+                    data.vehicleVerticalSpeed = (height - data.lastVehicleHeight) / CONFIG.VehicleCheckInterval
+                else
+                    data.vehicleVerticalSpeed = 0
+                end
+                data.lastVehicleHeight = height
+                if isOnRamp(primaryPart.Position, data) then continue end
+                if data.vehicleVerticalSpeed < CONFIG.MaxFallSpeed then
+                    warn("[AntiCheat] Бешеное падение: " .. player.Name)
+                    local rayResult = Workspace:Raycast(primaryPart.Position, Vector3.new(0, -200, 0))
+                    if rayResult then
+                        vehicle:TranslateBy(rayResult.Position + Vector3.new(0, 3, 0) - primaryPart.Position)
+                    end
+                end
+                if height > CONFIG.MaxVehicleHeight and data.vehicleVerticalSpeed > -10 then
+                    warn("[AntiCheat] Флайкар: " .. player.Name)
+                    local rayResult = Workspace:Raycast(primaryPart.Position, Vector3.new(0, -200, 0))
+                    if rayResult then
+                        vehicle:TranslateBy(rayResult.Position + Vector3.new(0, 3, 0) - primaryPart.Position)
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- =================== ЗАПУСК ===================
+print("🛡️ AntiCheat v3.5 (Final) запущен!")
+setupRemoteProtection()
+setupMovementProtection()
+setupVehicleProtection()
