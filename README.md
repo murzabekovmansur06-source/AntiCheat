@@ -78,3 +78,5 @@ local CONFIG = {
 ## 📅 Последнее обновление
 
 Июнь 2026 — v3.5 (финальная стабильная версия)
+**GitHub** : https://github.com/murzabekovmansur06-source"
+**Discord** : "https://discord.gg/9qY2GJ3UQR"
